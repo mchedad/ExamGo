@@ -31,9 +31,10 @@ type Batch struct {
 
 // BatchRequest représente la requête d'un client pour vérifier un lot d'URLs.
 type BatchRequest struct {
-	URLs        []string `json:"urls"`
-	Concurrency int      `json:"concurrency,omitempty"` // niveau de parallélisme (défaut : 5)
-	TimeoutSec  int      `json:"timeout_sec,omitempty"` // délai d'expiration par URL en secondes (défaut : 10)
+	URLs             []string `json:"urls"`
+	Concurrency      int      `json:"concurrency,omitempty"`        // niveau de parallélisme (défaut : 5)
+	TimeoutSec       int      `json:"timeout_sec,omitempty"`        // timeout global du lot en secondes (défaut : 30)
+	PerURLTimeoutSec int      `json:"per_url_timeout_sec,omitempty"` // timeout par URL en secondes (défaut : 10)
 }
 
 // Summarize calcule le résumé agrégé à partir d'une slice de CheckResult.

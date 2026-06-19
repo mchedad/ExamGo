@@ -62,7 +62,12 @@ func (h *Handler) CreateBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.TimeoutSec < 0 {
-		valErr := domain.NewValidationError("timeout_sec", "le délai d'expiration ne peut pas être négatif")
+		valErr := domain.NewValidationError("timeout_sec", "le délai d'expiration global ne peut pas être négatif")
+		h.respondError(w, http.StatusBadRequest, valErr.Error())
+		return
+	}
+	if req.PerURLTimeoutSec < 0 {
+		valErr := domain.NewValidationError("per_url_timeout_sec", "le délai d'expiration par URL ne peut pas être négatif")
 		h.respondError(w, http.StatusBadRequest, valErr.Error())
 		return
 	}
@@ -72,18 +77,22 @@ func (h *Handler) CreateBatch(w http.ResponseWriter, r *http.Request) {
 	if concurrency == 0 {
 		concurrency = 5
 	}
-	timeout := req.TimeoutSec
-	if timeout == 0 {
-		timeout = 10
+	globalTimeout := req.TimeoutSec
+	if globalTimeout == 0 {
+		globalTimeout = 30
+	}
+	perURLTimeout := req.PerURLTimeoutSec
+	if perURLTimeout == 0 {
+		perURLTimeout = 10
 	}
 
-	// Créer un context avec timeout
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeout)*time.Second)
+	// Créer un context avec timeout global pour le lot entier
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(globalTimeout)*time.Second)
 	defer cancel()
 
-	// Lancer la vérification concurrente
+	// Lancer la vérification concurrente avec le timeout per-URL
 	start := time.Now()
-	results := pool.Run(ctx, h.checker, req.URLs, concurrency)
+	results := pool.Run(ctx, h.checker, req.URLs, concurrency, time.Duration(perURLTimeout)*time.Second)
 	duration := time.Since(start)
 
 	// Calculer le résumé via la fonction d'agrégation du domaine

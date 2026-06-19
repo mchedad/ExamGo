@@ -25,55 +25,53 @@ checker  store        →  implémentations concrètes
 
 ### 1. Inversion de dépendance via `internal/domain`
 
-Les interfaces `Checker` et `Store` sont définies dans le package `domain`. Les packages `checker` et `store` en dépendent — jamais l'inverse. Cela permet :
-- De **remplacer** une implémentation (ex. : store SQLite au lieu de mémoire) sans toucher à l'API.
-- De **tester** facilement avec des mocks.
+Les interfaces `Checker` et `Store` sont définies dans `domain`. Les packages concrets en dépendent — jamais l'inverse. Cela permet de remplacer une implémentation (ex : store SQLite) ou de tester avec des mocks sans toucher aux couches supérieures.
 
-### 2. Worker Pool (fan-out / fan-in) — Cœur concurrent
-
-Le package `pool` implémente un pattern **fan-out / fan-in** avec un nombre borné de workers.
+### 2. Worker Pool (fan-out / fan-in)
 
 #### Choix des channels
 
-| Canal | Type | Buffer | Justification |
-|-------|------|--------|---------------|
-| `jobs` | `chan string` | `concurrency` | Borné au nombre de workers. Un buffer de taille `concurrency` permet à l'émetteur de pousser des URLs sans bloquer tant qu'il y a des workers libres, sans allouer de mémoire pour toutes les URLs (contrairement à `len(urls)` qui serait du gaspillage pour de gros lots). |
-| `results` | `chan CheckResult` | `len(urls)` | Chaque URL produit exactement un résultat. Un buffer de cette taille **garantit que les workers ne bloquent jamais en écriture**, même si le collecteur n'a pas encore commencé à lire. Cela élimine tout risque de deadlock. |
+| Canal | Buffer | Justification |
+|-------|--------|---------------|
+| `jobs` | `concurrency` | Évite d'allouer de la mémoire pour toutes les URLs. L'émetteur peut pousser sans bloquer tant qu'il y a des workers libres. |
+| `results` | `len(urls)` | Les workers ne bloquent jamais en écriture → aucun risque de deadlock. |
 
-#### Channels directionnels
+Les canaux sont **directionnels** dans la signature de `worker` (`<-chan` / `chan<-`) pour une sécurité à la compilation.
 
-Dans la signature de la fonction `worker`, les canaux sont typés de manière directionnelle :
-- `jobs <-chan string` — lecture seule : le worker consomme les URLs
-- `results chan<- CheckResult` — écriture seule : le worker produit les résultats
-
-Cela apporte une **sécurité à la compilation** : le compilateur Go interdit toute opération interdite (un worker ne peut pas fermer le canal `jobs`, par exemple).
-
-#### Distribution des URLs dans une goroutine séparée
-
-L'envoi des URLs dans le canal `jobs` se fait dans une goroutine dédiée (et non sur la goroutine principale). C'est **indispensable** pour éviter un deadlock : si le canal `jobs` est plus petit que `len(urls)`, l'émetteur bloquerait en attendant que des workers consomment, mais les workers ne consommeraient pas car la goroutine principale serait bloquée avant d'arriver à la collecte des résultats.
-
-Cette goroutine écoute aussi `ctx.Done()` : si le contexte global est annulé, elle arrête d'envoyer de nouvelles URLs et ferme le canal `jobs` via `defer close(jobs)`.
+L'envoi des URLs se fait dans une **goroutine séparée** : si le canal `jobs` est plus petit que `len(urls)`, l'émetteur bloquerait sur le goroutine principal avant d'arriver à la collecte. Cette goroutine écoute aussi `ctx.Done()` pour arrêter l'envoi en cas d'annulation.
 
 #### Timeout à deux niveaux
 
-- **Timeout global** (`TimeoutSec`) : un `context.WithTimeout` enveloppe l'ensemble du lot. Si le délai expire, toutes les vérifications en cours sont annulées.
-- **Timeout per-URL** (`PerURLTimeoutSec`) : chaque worker crée un sous-contexte `context.WithTimeout(ctx, perURLTimeout)` avant d'appeler `checker.Check`. Si le contexte global expire, les sous-contextes sont aussi annulés automatiquement (propriété de `context.WithTimeout` sur un parent annulé).
-
-#### Synchronisation
-
-- **`sync.WaitGroup`** : chaque worker fait `defer wg.Done()` pour garantir le décrément même en cas de panique. La goroutine de fan-in attend `wg.Wait()` puis ferme `results`.
-- **`sync.RWMutex`** dans `MemoryStore` : protège les accès concurrents au map des batches (lecture partagée via `RLock`, écriture exclusive via `Lock`).
+- **Global** : `context.WithTimeout` enveloppe le lot entier (calculé selon le nombre d'URLs et la concurrence).
+- **Per-URL** : chaque worker crée un sous-contexte avec `timeout_ms`. Si le parent expire, les sous-contextes sont annulés automatiquement.
 
 #### Anti-patterns évités
 
 | Anti-pattern | Comment il est évité |
 |---|---|
-| Goroutine par URL sans borne | Exactement `concurrency` goroutines sont lancées, jamais plus |
-| Ignorer `ctx.Done()` | Les workers testent `ctx.Done()` avant chaque check + le sub-context per-URL propage l'annulation |
-| Channel jamais fermé (deadlock) | `close(jobs)` via `defer` dans l'émetteur + `close(results)` après `wg.Wait()` |
-| WaitGroup mal géré | `wg.Add(1)` avant le `go`, `defer wg.Done()` dans chaque worker |
-| Data race | Aucune donnée partagée entre goroutines — toute communication passe par des channels |
+| Goroutine par URL sans borne | Exactement `concurrency` goroutines |
+| Ignorer `ctx.Done()` | Test avant chaque check + sub-context per-URL |
+| Channel non fermé (deadlock) | `defer close(jobs)` + `close(results)` après `wg.Wait()` |
+| WaitGroup mal géré | `wg.Add(1)` avant le `go`, `defer wg.Done()` |
+| Data race | Communication exclusivement par channels |
 
-### 6. Logging structuré avec `log/slog`
+### 3. Choix de `net/http` (stdlib) plutôt que Gin
 
-Utilisation du package standard `log/slog` (Go 1.21+) pour un logging structuré JSON, facilitant l'observabilité.
+Nous utilisons `net/http` de la bibliothèque standard plutôt que Gin pour les raisons suivantes :
+
+1. **Zéro dépendance externe** : le projet ne dépend que de la stdlib Go, ce qui simplifie la maintenance et les mises à jour.
+2. **Go 1.22+ enhanced routing** : depuis Go 1.22, `http.ServeMux` supporte nativement les patterns avec méthode (`"POST /v1/checks"`) et les paramètres de chemin (`{id}`), comblant l'écart principal avec Gin.
+3. **Contrôle total** : pas de magie ni de conventions cachées. Le middleware est une simple fonction `func(http.Handler) http.Handler`.
+4. **Adapté à un microservice** : pour une API REST avec 3 endpoints, un framework complet comme Gin serait surdimensionné.
+5. **Cohérence pédagogique** : utiliser la stdlib permet de maîtriser les mécanismes fondamentaux de Go (Handler, HandlerFunc, middleware pattern).
+
+### 4. Contrat d'erreur uniforme
+
+Toutes les erreurs renvoient le même format JSON `{ "error": { "code": "...", "message": "..." } }` avec le code HTTP approprié (400, 404, 405, 500). Cela simplifie le parsing côté client.
+
+### 5. Logging structuré (`log/slog`)
+
+- Handler JSON pour une observabilité machine.
+- Niveau configurable via `LOG_LEVEL` (env var).
+- `/healthz` exclu des logs pour éviter la pollution par les sondes de vivacité.
+- Middleware de recovery : une panic est catchée, loggée et transformée en réponse 500 propre.

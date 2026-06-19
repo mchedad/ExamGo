@@ -1,86 +1,64 @@
 # URLWatch
 
-Microservice de **vérification d'URLs en masse** écrit en Go.
-
-## Description
-
-URLWatch permet d'envoyer un lot d'URLs à vérifier. Le service les interroge **en parallèle** (code HTTP, latence, disponibilité), **agrège** les résultats et les **expose** via une API REST. Chaque lot de vérifications (« batch ») est conservé et consultable a posteriori.
+Microservice de **vérification d'URLs en masse** en Go.
 
 ## Build & Run
 
 ```bash
-# Build
 go build ./...
-
-# Vérification statique
 go vet ./...
-
-# Tests
 go test ./...
 
-# Lancement
-go run ./cmd/urlwatch
+# Lancement (LOG_LEVEL: DEBUG, INFO, WARN, ERROR)
+LOG_LEVEL=INFO go run ./cmd/urlwatch
 ```
 
-Le serveur démarre par défaut sur le port **8080**.
+Le serveur démarre sur le port **8080**.
 
 ## API REST
 
 ### Health check
 
 ```bash
-curl http://localhost:8080/api/health
+curl http://localhost:8080/healthz
 ```
 
-### Créer un batch de vérification
+### Créer un lot de vérifications
 
 ```bash
-curl -X POST http://localhost:8080/api/batches \
+curl -X POST http://localhost:8080/v1/checks \
   -H "Content-Type: application/json" \
   -d '{
-    "urls": [
-      "https://www.google.com",
-      "https://www.github.com",
-      "https://httpstat.us/500",
-      "https://domaine-inexistant.xyz"
-    ],
-    "concurrency": 3,
-    "timeout_sec": 5
+    "urls": ["https://go.dev", "https://github.com", "https://exemple.invalid"],
+    "options": { "concurrency": 4, "timeout_ms": 2000 }
   }'
 ```
 
-### Consulter un batch par ID
-
-```bash
-curl http://localhost:8080/api/batches/{id}
+Réponse `201 Created` :
+```json
+{
+  "batch_id": "b_4f3c1a",
+  "created_at": "2026-06-18T10:00:00Z",
+  "summary": { "total": 3, "up": 2, "down": 1, "duration_ms": 812 },
+  "results": [
+    { "url": "https://go.dev", "status_code": 200, "ok": true, "latency_ms": 120 },
+    { "url": "https://exemple.invalid", "ok": false, "error": "dns: no such host", "latency_ms": 2001 }
+  ]
+}
 ```
 
-### Lister tous les batches
+### Consulter un lot par ID
 
 ```bash
-curl http://localhost:8080/api/batches
+curl http://localhost:8080/v1/checks/{batch_id}
+```
+
+### Contrat d'erreur
+
+```json
+{ "error": { "code": "batch_not_found", "message": "aucun lot avec l'id b_x" } }
 ```
 
 ## Architecture
 
-Voir [DESIGN.md](DESIGN.md) pour la justification architecturale.
-
-## Structure du projet
-
-```
-urlwatch/
-├── go.mod
-├── README.md
-├── DESIGN.md
-├── JOURNAL_IA.md
-├── .gitignore
-├── cmd/
-│   └── urlwatch/
-│       └── main.go          # point d'entrée, câblage des dépendances
-└── internal/
-    ├── domain/              # types métier, erreurs, interfaces
-    ├── checker/             # implémentation HTTP du Checker (+ mock)
-    ├── pool/                # worker pool concurrent (fan-out / fan-in)
-    ├── store/               # persistance en mémoire
-    └── api/                 # handlers HTTP, routage, middleware
-```
+Voir [DESIGN.md](DESIGN.md).

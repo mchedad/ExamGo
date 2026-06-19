@@ -1,4 +1,3 @@
-// Package api fournit les handlers HTTP, le routage et les middlewares.
 package api
 
 import (
@@ -9,185 +8,143 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"time"
 
 	"moduleGo/urlwatch/internal/domain"
 	"moduleGo/urlwatch/internal/pool"
 )
 
-// Handler regroupe les dépendances pour les handlers HTTP.
+// Types pour le contrat d'erreur JSON.
+type apiErr struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type errorBody struct {
+	Error apiErr `json:"error"`
+}
+
 type Handler struct {
 	checker domain.Checker
 	store   domain.Store
 	logger  *slog.Logger
 }
 
-// NewRouter crée et configure le routeur HTTP avec tous les endpoints.
 func NewRouter(checker domain.Checker, store domain.Store, logger *slog.Logger) http.Handler {
-	h := &Handler{
-		checker: checker,
-		store:   store,
-		logger:  logger,
-	}
-
+	h := &Handler{checker: checker, store: store, logger: logger}
 	mux := http.NewServeMux()
 
-	// Endpoints REST
-	mux.HandleFunc("POST /api/batches", h.CreateBatch)
-	mux.HandleFunc("GET /api/batches/{id}", h.GetBatch)
-	mux.HandleFunc("GET /api/batches", h.ListBatches)
-	mux.HandleFunc("GET /api/health", h.Health)
+	mux.HandleFunc("POST /v1/checks", h.CreateBatch)
+	mux.HandleFunc("GET /v1/checks/{id}", h.GetBatch)
+	mux.HandleFunc("GET /healthz", h.Health)
 
-	// Appliquer le middleware de logging
-	return loggingMiddleware(logger, mux)
+	return recoveryMiddleware(logger, loggingMiddleware(logger, mux))
 }
 
-// CreateBatch gère la création d'un nouveau lot de vérifications.
 func (h *Handler) CreateBatch(w http.ResponseWriter, r *http.Request) {
 	var req domain.BatchRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondError(w, http.StatusBadRequest, "requête JSON invalide: "+err.Error())
+		h.respondErr(w, http.StatusBadRequest, "invalid_request", "corps JSON invalide: "+err.Error())
 		return
 	}
 
-	// Validation avec erreur personnalisée ValidationError
+	// Validation des URLs
 	if len(req.URLs) == 0 {
-		valErr := domain.NewValidationError("urls", "la liste d'URLs ne peut pas être vide")
-		h.respondError(w, http.StatusBadRequest, valErr.Error())
+		h.respondErr(w, http.StatusBadRequest, "invalid_request", "urls est obligatoire et ne peut pas être vide")
 		return
 	}
-	if req.Concurrency < 0 {
-		valErr := domain.NewValidationError("concurrency", "le niveau de parallélisme ne peut pas être négatif")
-		h.respondError(w, http.StatusBadRequest, valErr.Error())
+	if len(req.URLs) > 100 {
+		h.respondErr(w, http.StatusBadRequest, "invalid_request", "urls ne peut pas contenir plus de 100 entrées")
 		return
 	}
-	if req.TimeoutSec < 0 {
-		valErr := domain.NewValidationError("timeout_sec", "le délai d'expiration global ne peut pas être négatif")
-		h.respondError(w, http.StatusBadRequest, valErr.Error())
-		return
-	}
-	if req.PerURLTimeoutSec < 0 {
-		valErr := domain.NewValidationError("per_url_timeout_sec", "le délai d'expiration par URL ne peut pas être négatif")
-		h.respondError(w, http.StatusBadRequest, valErr.Error())
-		return
-	}
-
-	// Valeurs par défaut
-	concurrency := req.Concurrency
-	if concurrency == 0 {
-		concurrency = 5
-	}
-	globalTimeout := req.TimeoutSec
-	if globalTimeout == 0 {
-		globalTimeout = 30
-	}
-	perURLTimeout := req.PerURLTimeoutSec
-	if perURLTimeout == 0 {
-		perURLTimeout = 10
-	}
-
-	// Créer un context avec timeout global pour le lot entier
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(globalTimeout)*time.Second)
-	defer cancel()
-
-	// Lancer la vérification concurrente avec le timeout per-URL
-	start := time.Now()
-	results := pool.Run(ctx, h.checker, req.URLs, concurrency, time.Duration(perURLTimeout)*time.Second)
-	duration := time.Since(start)
-
-	// Calculer le résumé via la fonction d'agrégation du domaine
-	summary := domain.Summarize(results, duration)
-
-	batch := domain.Batch{
-		ID:        generateID(),
-		CreatedAt: time.Now(),
-		Results:   results,
-		Summary:   summary,
-	}
-
-	// Persister le batch
-	if err := h.store.Save(r.Context(), batch); err != nil {
-		// Utiliser errors.As pour détecter une ValidationError
-		var valErr *domain.ValidationError
-		if errors.As(err, &valErr) {
-			h.respondError(w, http.StatusBadRequest, err.Error())
+	for _, raw := range req.URLs {
+		u, err := url.Parse(raw)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			h.respondErr(w, http.StatusBadRequest, "invalid_request",
+				fmt.Sprintf("URL invalide (http/https requis): %s", raw))
 			return
 		}
-		h.respondError(w, http.StatusInternalServerError, "erreur de sauvegarde: "+err.Error())
+	}
+
+	// Defaults et bornes pour concurrency
+	concurrency := req.Options.Concurrency
+	if concurrency == 0 {
+		concurrency = 8
+	}
+	if concurrency < 1 || concurrency > 50 {
+		h.respondErr(w, http.StatusBadRequest, "invalid_request", "concurrency doit être entre 1 et 50")
 		return
 	}
 
-	h.logger.Info("batch créé",
-		"id", batch.ID,
-		"total", batch.Summary.Total,
-		"available", batch.Summary.Available,
-		"duration_ms", batch.Summary.DurationMs,
-	)
+	// Defaults et bornes pour timeout_ms (per-URL)
+	timeoutMs := req.Options.TimeoutMs
+	if timeoutMs == 0 {
+		timeoutMs = 5000
+	}
+	if timeoutMs < 100 || timeoutMs > 30000 {
+		h.respondErr(w, http.StatusBadRequest, "invalid_request", "timeout_ms doit être entre 100 et 30000")
+		return
+	}
 
+	perURLTimeout := time.Duration(timeoutMs) * time.Millisecond
+	// Timeout global : assez de temps pour tous les "rounds" de workers
+	globalTimeout := perURLTimeout * time.Duration(len(req.URLs)/concurrency+1)
+	ctx, cancel := context.WithTimeout(r.Context(), globalTimeout)
+	defer cancel()
+
+	start := time.Now()
+	results := pool.Run(ctx, h.checker, req.URLs, concurrency, perURLTimeout)
+	duration := time.Since(start)
+
+	summary := domain.Summarize(results, duration)
+	batch := domain.Batch{
+		ID:        generateBatchID(),
+		CreatedAt: time.Now().UTC(),
+		Summary:   summary,
+		Results:   results,
+	}
+
+	if err := h.store.Save(r.Context(), batch); err != nil {
+		h.respondErr(w, http.StatusInternalServerError, "internal", "erreur de sauvegarde: "+err.Error())
+		return
+	}
+
+	h.logger.Info("batch créé", "batch_id", batch.ID, "total", summary.Total, "up", summary.Up, "duration_ms", summary.DurationMs)
 	h.respondJSON(w, http.StatusCreated, batch)
 }
 
-// GetBatch retourne un batch par son identifiant.
 func (h *Handler) GetBatch(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	batch, err := h.store.Get(r.Context(), id)
 	if err != nil {
-		// Utiliser errors.Is pour traduire ErrBatchNotFound en 404
 		if errors.Is(err, domain.ErrBatchNotFound) {
-			h.respondError(w, http.StatusNotFound, err.Error())
+			h.respondErr(w, http.StatusNotFound, "batch_not_found",
+				fmt.Sprintf("aucun lot avec l'id %s", id))
 			return
 		}
-		h.respondError(w, http.StatusInternalServerError, err.Error())
+		h.respondErr(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
 	h.respondJSON(w, http.StatusOK, batch)
 }
 
-// ListBatches retourne la liste de tous les batches.
-func (h *Handler) ListBatches(w http.ResponseWriter, r *http.Request) {
-	batches, err := h.store.List(r.Context())
-	if err != nil {
-		h.respondError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	h.respondJSON(w, http.StatusOK, batches)
-}
-
-// Health retourne un status de santé du service.
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	h.respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// respondJSON envoie une réponse JSON.
 func (h *Handler) respondJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		h.logger.Error("erreur encodage JSON", "error", err)
-	}
+	json.NewEncoder(w).Encode(data)
 }
 
-// respondError envoie une réponse d'erreur JSON.
-func (h *Handler) respondError(w http.ResponseWriter, status int, message string) {
-	h.respondJSON(w, status, map[string]string{"error": message})
+func (h *Handler) respondErr(w http.ResponseWriter, status int, code, message string) {
+	h.respondJSON(w, status, errorBody{Error: apiErr{Code: code, Message: message}})
 }
 
-// loggingMiddleware log chaque requête HTTP entrante.
-func loggingMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		next.ServeHTTP(w, r)
-		logger.Info("requête HTTP",
-			"method", r.Method,
-			"path", r.URL.Path,
-			"duration", time.Since(start),
-		)
-	})
-}
-
-// generateID génère un identifiant unique pour un batch.
-func generateID() string {
-	b := make([]byte, 8)
-	_, _ = rand.Read(b)
-	return fmt.Sprintf("%x", b)
+func generateBatchID() string {
+	b := make([]byte, 3)
+	rand.Read(b)
+	return fmt.Sprintf("b_%x", b)
 }

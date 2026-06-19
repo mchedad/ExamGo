@@ -15,11 +15,11 @@ import (
 // - checker : l'implémentation du Checker à utiliser
 // - urls : la liste des URLs à vérifier
 // - concurrency : le nombre maximum de goroutines concurrentes
-func Run(ctx context.Context, checker domain.Checker, urls []string, concurrency int) []domain.URLResult {
+func Run(ctx context.Context, checker domain.Checker, urls []string, concurrency int) []domain.CheckResult {
 	// Canal pour distribuer les URLs aux workers (fan-out)
 	jobs := make(chan string, len(urls))
 	// Canal pour collecter les résultats (fan-in)
-	results := make(chan domain.URLResult, len(urls))
+	results := make(chan domain.CheckResult, len(urls))
 
 	// Lancer les workers
 	var wg sync.WaitGroup
@@ -30,7 +30,7 @@ func Run(ctx context.Context, checker domain.Checker, urls []string, concurrency
 			for url := range jobs {
 				select {
 				case <-ctx.Done():
-					results <- domain.URLResult{
+					results <- domain.CheckResult{
 						URL:   url,
 						Error: ctx.Err().Error(),
 					}
@@ -54,7 +54,7 @@ func Run(ctx context.Context, checker domain.Checker, urls []string, concurrency
 	}()
 
 	// Collecter tous les résultats
-	var allResults []domain.URLResult
+	var allResults []domain.CheckResult
 	for r := range results {
 		allResults = append(allResults, r)
 	}

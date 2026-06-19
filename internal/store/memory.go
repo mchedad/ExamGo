@@ -2,6 +2,8 @@
 package store
 
 import (
+	"context"
+	"fmt"
 	"sync"
 
 	"moduleGo/urlwatch/internal/domain"
@@ -22,26 +24,31 @@ func NewMemoryStore() *MemoryStore {
 }
 
 // Save persiste un batch dans le store.
-func (s *MemoryStore) Save(batch domain.Batch) error {
+func (s *MemoryStore) Save(_ context.Context, b domain.Batch) error {
+	if b.ID == "" {
+		return domain.NewValidationError("id", "l'identifiant du batch ne peut pas être vide")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.batches[batch.ID] = batch
+	s.batches[b.ID] = b
 	return nil
 }
 
 // Get récupère un batch par son identifiant.
-func (s *MemoryStore) Get(id string) (domain.Batch, error) {
+// Retourne une erreur wrappant ErrBatchNotFound si l'ID est inconnu,
+// exploitable via errors.Is(err, domain.ErrBatchNotFound).
+func (s *MemoryStore) Get(_ context.Context, id string) (domain.Batch, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	batch, ok := s.batches[id]
 	if !ok {
-		return domain.Batch{}, domain.ErrBatchNotFound
+		return domain.Batch{}, fmt.Errorf("store.Get(%q): %w", id, domain.ErrBatchNotFound)
 	}
 	return batch, nil
 }
 
 // List retourne tous les batches stockés.
-func (s *MemoryStore) List() ([]domain.Batch, error) {
+func (s *MemoryStore) List(_ context.Context) ([]domain.Batch, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	result := make([]domain.Batch, 0, len(s.batches))

@@ -3,16 +3,16 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"moduleGo/urlwatch/internal/domain"
 	"moduleGo/urlwatch/internal/pool"
-
-	"crypto/rand"
-	"fmt"
 )
 
 // Handler regroupe les dépendances pour les handlers HTTP.
@@ -50,19 +50,30 @@ func (h *Handler) CreateBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validation
+	// Validation avec erreur personnalisée ValidationError
 	if len(req.URLs) == 0 {
-		h.respondError(w, http.StatusBadRequest, domain.ErrEmptyURLs.Error())
+		valErr := domain.NewValidationError("urls", "la liste d'URLs ne peut pas être vide")
+		h.respondError(w, http.StatusBadRequest, valErr.Error())
+		return
+	}
+	if req.Concurrency < 0 {
+		valErr := domain.NewValidationError("concurrency", "le niveau de parallélisme ne peut pas être négatif")
+		h.respondError(w, http.StatusBadRequest, valErr.Error())
+		return
+	}
+	if req.TimeoutSec < 0 {
+		valErr := domain.NewValidationError("timeout_sec", "le délai d'expiration ne peut pas être négatif")
+		h.respondError(w, http.StatusBadRequest, valErr.Error())
 		return
 	}
 
 	// Valeurs par défaut
 	concurrency := req.Concurrency
-	if concurrency <= 0 {
+	if concurrency == 0 {
 		concurrency = 5
 	}
 	timeout := req.TimeoutSec
-	if timeout <= 0 {
+	if timeout == 0 {
 		timeout = 10
 	}
 
@@ -75,29 +86,24 @@ func (h *Handler) CreateBatch(w http.ResponseWriter, r *http.Request) {
 	results := pool.Run(ctx, h.checker, req.URLs, concurrency)
 	duration := time.Since(start)
 
-	// Calculer le résumé
-	available := 0
-	for _, res := range results {
-		if res.Available {
-			available++
-		}
-	}
+	// Calculer le résumé via la fonction d'agrégation du domaine
+	summary := domain.Summarize(results, duration)
 
 	batch := domain.Batch{
-		ID:   generateID(),
-		URLs: req.URLs,
-		Results: results,
-		Summary: domain.BatchSummary{
-			Total:     len(req.URLs),
-			Available: available,
-			Failed:    len(req.URLs) - available,
-			Duration:  duration,
-		},
+		ID:        generateID(),
 		CreatedAt: time.Now(),
+		Results:   results,
+		Summary:   summary,
 	}
 
 	// Persister le batch
-	if err := h.store.Save(batch); err != nil {
+	if err := h.store.Save(r.Context(), batch); err != nil {
+		// Utiliser errors.As pour détecter une ValidationError
+		var valErr *domain.ValidationError
+		if errors.As(err, &valErr) {
+			h.respondError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		h.respondError(w, http.StatusInternalServerError, "erreur de sauvegarde: "+err.Error())
 		return
 	}
@@ -106,7 +112,7 @@ func (h *Handler) CreateBatch(w http.ResponseWriter, r *http.Request) {
 		"id", batch.ID,
 		"total", batch.Summary.Total,
 		"available", batch.Summary.Available,
-		"duration", batch.Summary.Duration,
+		"duration_ms", batch.Summary.DurationMs,
 	)
 
 	h.respondJSON(w, http.StatusCreated, batch)
@@ -115,9 +121,14 @@ func (h *Handler) CreateBatch(w http.ResponseWriter, r *http.Request) {
 // GetBatch retourne un batch par son identifiant.
 func (h *Handler) GetBatch(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	batch, err := h.store.Get(id)
+	batch, err := h.store.Get(r.Context(), id)
 	if err != nil {
-		h.respondError(w, http.StatusNotFound, err.Error())
+		// Utiliser errors.Is pour traduire ErrBatchNotFound en 404
+		if errors.Is(err, domain.ErrBatchNotFound) {
+			h.respondError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		h.respondError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	h.respondJSON(w, http.StatusOK, batch)
@@ -125,7 +136,7 @@ func (h *Handler) GetBatch(w http.ResponseWriter, r *http.Request) {
 
 // ListBatches retourne la liste de tous les batches.
 func (h *Handler) ListBatches(w http.ResponseWriter, r *http.Request) {
-	batches, err := h.store.List()
+	batches, err := h.store.List(r.Context())
 	if err != nil {
 		h.respondError(w, http.StatusInternalServerError, err.Error())
 		return

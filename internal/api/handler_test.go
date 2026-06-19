@@ -59,8 +59,8 @@ func (m *mockStore) List(_ context.Context) ([]domain.Batch, error) {
 
 func newTestRouter() http.Handler {
 	checker := &mockChecker{results: map[string]domain.CheckResult{
-		"https://go.dev":           {URL: "https://go.dev", StatusCode: 200, OK: true, LatencyMs: 50},
-		"https://exemple.invalid":  {URL: "https://exemple.invalid", OK: false, Error: "dns: no such host", LatencyMs: 2001},
+		"https://go.dev":          {URL: "https://go.dev", StatusCode: 200, OK: true, LatencyMs: 50},
+		"https://exemple.invalid": {URL: "https://exemple.invalid", OK: false, Error: "dns: no such host", LatencyMs: 2001},
 	}}
 	store := newMockStore()
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil)) // discard

@@ -2,6 +2,8 @@
 
 Microservice de **vérification d'URLs en masse** en Go.
 
+Par Chedad Mehdi
+
 ## Build & Run
 
 ```bash
